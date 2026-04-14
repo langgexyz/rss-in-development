@@ -59,20 +59,21 @@ CREATE TABLE feeds (
 
 ```sql
 CREATE TABLE articles (
-    id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    feed_id      BIGINT UNSIGNED NOT NULL,
-    guid         VARCHAR(2048)   NOT NULL,
-    title        VARCHAR(1024)   NOT NULL DEFAULT '',
-    link         VARCHAR(2048),
-    content      MEDIUMTEXT,
-    author       VARCHAR(512),
-    published_at DATETIME,
+    id               BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    feed_id          BIGINT UNSIGNED NOT NULL,
+    guid             TEXT,                           -- 原始 guid，保留供调试，不建索引
+    guid_hash        CHAR(64) NOT NULL,              -- SHA256(normalized_guid)，定长，用于唯一约束
+    title            VARCHAR(1024) NOT NULL DEFAULT '',
+    link             VARCHAR(2048),
+    content          MEDIUMTEXT,
+    author           VARCHAR(512),
+    published_at     DATETIME,
     is_read          TINYINT(1) NOT NULL DEFAULT 0,
     is_starred       TINYINT(1) NOT NULL DEFAULT 0,
-    is_full_content  TINYINT(1) NOT NULL DEFAULT 0,  -- P2：全文已抓取，刷新时不覆盖 content
+    is_full_content  TINYINT(1) NOT NULL DEFAULT 0,  -- 全文已抓取，刷新时保护 content 不被摘要覆盖
     created_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-    UNIQUE KEY uq_feed_guid (feed_id, guid),
+    UNIQUE KEY uq_feed_guid_hash (feed_id, guid_hash),  -- CHAR(64) 定长，索引无溢出风险
     INDEX idx_feed_id (feed_id),
     INDEX idx_published_at (published_at),
     FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE
@@ -81,9 +82,11 @@ CREATE TABLE articles (
 
 **关键决策：**
 
-- `(feed_id, guid)` 联合唯一索引：重复抓取幂等入库（`INSERT IGNORE`）
+- `guid_hash CHAR(64)`：存储 `SHA256(normalized_guid)`，定长避免 MySQL 索引溢出（VARCHAR(2048) 的 utf8mb4 索引会超出 InnoDB 3072 字节上限）；原始 guid 保留在 `guid TEXT` 供调试
+- `guid_hash` 生成优先级：`SHA256(原始guid/id)` → `SHA256(link)` → `SHA256(title+pubDate_UTC)`
+- 入库使用 `ON DUPLICATE KEY UPDATE`（非 `INSERT IGNORE`）：title/link/author 随源更新；`content` 仅在 `is_full_content=0` 时更新；`is_read`/`is_starred` 永不覆盖（用户状态）
 - `fetch_status` 存在 feeds 表：展示抓取进度，与文章读取完全解耦；未来可扩展为 SSE 推送通知
-- `is_read` / `is_starred` / `is_full_content` 存在 articles 表：单用户场景，无需 user_articles 关联表；`is_full_content=1` 时刷新订阅源不覆盖 content
+- `is_full_content=1` 时刷新订阅源不覆盖 content
 - `content` 使用 `MEDIUMTEXT`：支持 RSS 全文内容
 
 ---
@@ -251,8 +254,9 @@ type NormalizedFeed struct {
 }
 
 type NormalizedArticle struct {
-    GUID        string    // 各格式唯一ID统一映射到此，用于幂等入库
-                          // 降级策略：无 guid 时取 SHA256(link)，link 也无时取 SHA256(title+pubDate)
+    GUID        string    // 原始 guid/id 字符串，存入 articles.guid（TEXT，不建索引）
+    GUIDHash    string    // SHA256(GUID) 或降级值，存入 articles.guid_hash（CHAR(64)，建唯一索引）
+                          // 降级链：SHA256(原始guid) → SHA256(link) → SHA256(title+pubDate_UTC)
     Title       string
     Link        string
     Content     string    // 优先取全文，降级取摘要
@@ -298,7 +302,10 @@ Handler.CreateFeed()
         │ 1. repo.UpdateFetchStatus(feedID, "fetching")
         │ 2. fetcher.Fetch(url)              ← HTTP 拉取 + 格式检测 + mapper 转换
         │ 3. 得到 NormalizedFeed
-        │ 4. repo.UpsertArticles()           ← INSERT IGNORE on (feed_id, guid)
+        │ 4. repo.UpsertArticles()           ← ON DUPLICATE KEY UPDATE on (feed_id, guid_hash)
+        │                                       title/link/author 随源更新
+        │                                       content 仅在 is_full_content=0 时更新
+        │                                       is_read/is_starred 永不覆盖
         │ 5. repo.UpdateFetchStatus(feedID, "success") + 更新 title/last_fetched_at/source_updated_at
         └─▶ 失败时：repo.UpdateFetchStatus(feedID, "failed", errMsg)
 ```

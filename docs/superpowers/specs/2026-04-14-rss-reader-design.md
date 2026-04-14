@@ -61,7 +61,6 @@ CREATE TABLE feeds (
 CREATE TABLE articles (
     id               BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     feed_id          BIGINT UNSIGNED NOT NULL,
-    guid             TEXT,                           -- 原始 guid，保留供调试，不建索引
     guid_hash        CHAR(64) NOT NULL,              -- SHA256(normalized_guid)，定长，用于唯一约束
     title            VARCHAR(1024) NOT NULL DEFAULT '',
     link             VARCHAR(2048),
@@ -82,7 +81,7 @@ CREATE TABLE articles (
 
 **关键决策：**
 
-- `guid_hash CHAR(64)`：存储 `SHA256(normalized_guid)`，定长避免 MySQL 索引溢出（VARCHAR(2048) 的 utf8mb4 索引会超出 InnoDB 3072 字节上限）；原始 guid 保留在 `guid TEXT` 供调试
+- `guid_hash CHAR(64)`：存储 `SHA256(normalized_guid)`，定长避免 MySQL 索引溢出（VARCHAR(2048) 的 utf8mb4 索引会超出 InnoDB 3072 字节上限）；不存原始 guid，需要时重抓 feed 即可取到
 - `guid_hash` 生成优先级：`SHA256(原始guid/id)` → `SHA256(link)` → `SHA256(title+pubDate_UTC)`
 - 入库使用 `ON DUPLICATE KEY UPDATE`（非 `INSERT IGNORE`）：title/link/author 随源更新；`content` 仅在 `is_full_content=0` 时更新；`is_read`/`is_starred` 永不覆盖（用户状态）
 - `fetch_status` 存在 feeds 表：展示抓取进度，与文章读取完全解耦；未来可扩展为 SSE 推送通知
@@ -254,9 +253,8 @@ type NormalizedFeed struct {
 }
 
 type NormalizedArticle struct {
-    GUID        string    // 原始 guid/id 字符串，存入 articles.guid（TEXT，不建索引）
-    GUIDHash    string    // SHA256(GUID) 或降级值，存入 articles.guid_hash（CHAR(64)，建唯一索引）
-                          // 降级链：SHA256(原始guid) → SHA256(link) → SHA256(title+pubDate_UTC)
+    GUIDHash    string    // SHA256(normalized_guid)，存入 articles.guid_hash（CHAR(64)，建唯一索引）
+                          // 降级链：SHA256(原始guid/id) → SHA256(link) → SHA256(title+pubDate_UTC)
     Title       string
     Link        string
     Content     string    // 优先取全文，降级取摘要

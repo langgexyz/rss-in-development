@@ -185,8 +185,12 @@ backend/
 │   ├── service/                   # 业务逻辑
 │   │   ├── feed.go
 │   │   └── article.go
-│   ├── fetcher/                   # RSS 抓取（HTTP + XML 解析，不接触 DB）
-│   │   └── fetcher.go
+│   ├── fetcher/                   # RSS 抓取 + 格式检测 + 规范化映射
+│   │   ├── fetcher.go             # 入口：HTTP 拉取，检测格式，调对应 mapper
+│   │   ├── normalized.go          # 统一内部模型（NormalizedFeed / NormalizedArticle）
+│   │   ├── mapper_rss2.go         # RSS 2.0 → NormalizedFeed
+│   │   ├── mapper_atom.go         # Atom 1.0 → NormalizedFeed
+│   │   └── mapper_jsonfeed.go     # JSON Feed → NormalizedFeed
 │   ├── model/                     # GORM 模型
 │   │   ├── feed.go
 │   │   └── article.go
@@ -197,28 +201,77 @@ backend/
     └── 001_init.sql
 ```
 
+### 数据规范化层（Normalized Model）
+
+不同 RSS 格式字段差异显著：
+
+| 字段语义 | RSS 2.0 | Atom 1.0 | JSON Feed |
+|----------|---------|----------|-----------|
+| 唯一ID | `<guid>` | `<id>` | `id` |
+| 内容 | `<description>` | `<content>` / `<summary>` | `content_html` / `content_text` |
+| 发布时间 | `<pubDate>` | `<published>` / `<updated>` | `date_published` |
+| 作者 | `<author>` | `<author><name>` | `author.name` |
+| 链接 | `<link>` | `<link href="">` | `url` |
+
+fetcher 层在 HTTP 拉取后自动检测格式，交由对应 mapper 转换为统一内部结构，repository 和 handler 只与规范化模型交互，与具体格式完全解耦：
+
+```go
+// fetcher/normalized.go — 统一内部模型，不对外暴露
+type NormalizedFeed struct {
+    Title       string
+    Description string
+    SiteURL     string
+    Articles    []NormalizedArticle
+}
+
+type NormalizedArticle struct {
+    GUID        string    // 各格式唯一ID统一映射到此，用于幂等入库
+    Title       string
+    Link        string
+    Content     string    // 优先取全文，降级取摘要
+    Author      string
+    PublishedAt time.Time // 统一转换为 UTC
+}
+```
+
+mapper 各自独立，新增格式只需新增 mapper 文件，其余层零改动：
+
+```go
+// fetcher/fetcher.go
+func Fetch(url string) (*NormalizedFeed, error) {
+    body := httpGet(url)
+    switch detectFormat(body) {
+    case FormatRSS2:     return mapperRSS2(body)
+    case FormatAtom:     return mapperAtom(body)
+    case FormatJSONFeed: return mapperJSONFeed(body)
+    }
+}
+```
+
 ### 依赖关系
 
 ```
 Handler → Service → Repository → MySQL
-              └──→ Fetcher → 外部 RSS 源
+              └──→ Fetcher ──→ 格式检测
+                         ├──→ RSS2 Mapper   ┐
+                         ├──→ Atom Mapper   ├──→ NormalizedFeed → Repository
+                         └──→ JSON Mapper   ┘
+                         └──→ 外部 RSS 源
 ```
-
-Fetcher 只负责网络请求和 XML 解析，不接触数据库，可独立测试。
 
 ### 核心数据流：添加订阅源
 
 ```
 Handler.CreateFeed()
   │ 1. 校验 URL 格式
-  │ 2. repo.CreateFeed()                  → 写 feeds 表，status=pending
-  │ 3. go service.TriggerFetch(feedID)    ← goroutine，立即返回 202
+  │ 2. repo.CreateFeed()                    → 写 feeds 表，status=pending
+  │ 3. go service.TriggerFetch(feedID)      ← goroutine，立即返回 202
   │
   └─▶ TriggerFetch()（goroutine）
         │ 1. repo.UpdateFetchStatus(feedID, "fetching")
-        │ 2. fetcher.Fetch(url)            ← HTTP 拉取，超时见 config.yaml
-        │ 3. 解析 RSS items
-        │ 4. repo.UpsertArticles()         ← INSERT IGNORE on (feed_id, guid)
+        │ 2. fetcher.Fetch(url)              ← HTTP 拉取 + 格式检测 + mapper 转换
+        │ 3. 得到 NormalizedFeed
+        │ 4. repo.UpsertArticles()           ← INSERT IGNORE on (feed_id, guid)
         │ 5. repo.UpdateFetchStatus(feedID, "success") + 更新 title/last_fetched_at
         └─▶ 失败时：repo.UpdateFetchStatus(feedID, "failed", errMsg)
 ```

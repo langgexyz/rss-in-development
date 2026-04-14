@@ -20,17 +20,13 @@
 初始化命令：
 
 ```bash
-# 在主仓库根目录执行（先在外部建好裸仓库再挂载）
-git init --bare /tmp/rss-frontend.git
-git init --bare /tmp/rss-backend.git
+# 先在外部创建有初始提交的普通仓库（submodule add 要求目标有至少一个 commit）
+git init /tmp/rss-frontend && git -C /tmp/rss-frontend commit --allow-empty -m "init"
+git init /tmp/rss-backend  && git -C /tmp/rss-backend  commit --allow-empty -m "init"
 
-git submodule add /tmp/rss-frontend.git frontend
-git submodule add /tmp/rss-backend.git backend
-git submodule update --init
-
-# 在子仓库中做首次提交
-git -C frontend commit --allow-empty -m "init"
-git -C backend  commit --allow-empty -m "init"
+# 在主仓库根目录挂载为 submodule
+git submodule add /tmp/rss-frontend frontend
+git submodule add /tmp/rss-backend  backend
 ```
 
 ---
@@ -42,7 +38,7 @@ git -C backend  commit --allow-empty -m "init"
 ```sql
 CREATE TABLE feeds (
     id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    url             VARCHAR(2048)   NOT NULL UNIQUE,
+    url             VARCHAR(500)    NOT NULL UNIQUE,  -- 500×4=2000 字节，低于 InnoDB 3072 字节索引上限；覆盖绝大多数 RSS 源地址
     title           VARCHAR(512)    NOT NULL DEFAULT '',
     description     TEXT,
     site_url        VARCHAR(2048),
@@ -273,6 +269,7 @@ func Fetch(url string) (*NormalizedFeed, error) {
     case FormatRSS2:     return mapperRSS2(body)
     case FormatAtom:     return mapperAtom(body)
     case FormatJSONFeed: return mapperJSONFeed(body)
+    default:             return nil, fmt.Errorf("unsupported feed format: %s", url)
     }
 }
 ```
@@ -300,7 +297,8 @@ Handler.CreateFeed()
         │ 1. repo.UpdateFetchStatus(feedID, "fetching")
         │ 2. fetcher.Fetch(url)              ← HTTP 拉取 + 格式检测 + mapper 转换
         │ 3. 得到 NormalizedFeed
-        │ 4. repo.UpsertArticles()           ← ON DUPLICATE KEY UPDATE on (feed_id, guid_hash)
+        │ 4. 按 published_at DESC 取前 max_articles_per_feed 条（config 配置项）
+        │    repo.UpsertArticles()           ← ON DUPLICATE KEY UPDATE on (feed_id, guid_hash)
         │                                       title/link/author 随源更新
         │                                       content 仅在 is_full_content=0 时更新
         │                                       is_read/is_starred 永不覆盖

@@ -67,9 +67,10 @@ CREATE TABLE articles (
     content      MEDIUMTEXT,
     author       VARCHAR(512),
     published_at DATETIME,
-    is_read      TINYINT(1) NOT NULL DEFAULT 0,
-    is_starred   TINYINT(1) NOT NULL DEFAULT 0,
-    created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    is_read          TINYINT(1) NOT NULL DEFAULT 0,
+    is_starred       TINYINT(1) NOT NULL DEFAULT 0,
+    is_full_content  TINYINT(1) NOT NULL DEFAULT 0,  -- P2：全文已抓取，刷新时不覆盖 content
+    created_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     UNIQUE KEY uq_feed_guid (feed_id, guid),
     INDEX idx_feed_id (feed_id),
@@ -82,7 +83,7 @@ CREATE TABLE articles (
 
 - `(feed_id, guid)` 联合唯一索引：重复抓取幂等入库（`INSERT IGNORE`）
 - `fetch_status` 存在 feeds 表：展示抓取进度，与文章读取完全解耦；未来可扩展为 SSE 推送通知
-- `is_read` / `is_starred` 存在 articles 表：单用户场景，无需 user_articles 关联表
+- `is_read` / `is_starred` / `is_full_content` 存在 articles 表：单用户场景，无需 user_articles 关联表；`is_full_content=1` 时刷新订阅源不覆盖 content
 - `content` 使用 `MEDIUMTEXT`：支持 RSS 全文内容
 
 ---
@@ -149,6 +150,7 @@ CREATE TABLE articles (
   "url": "https://feeds.feedburner.com/ruanyifeng",
   "fetch_status": "success",
   "fetch_error": null,
+  "source_updated_at": "2026-04-12T09:00:00Z",
   "last_fetched_at": "2026-04-14T10:00:30Z"
 }
 ```
@@ -297,7 +299,7 @@ Handler.CreateFeed()
         │ 2. fetcher.Fetch(url)              ← HTTP 拉取 + 格式检测 + mapper 转换
         │ 3. 得到 NormalizedFeed
         │ 4. repo.UpsertArticles()           ← INSERT IGNORE on (feed_id, guid)
-        │ 5. repo.UpdateFetchStatus(feedID, "success") + 更新 title/last_fetched_at
+        │ 5. repo.UpdateFetchStatus(feedID, "success") + 更新 title/last_fetched_at/source_updated_at
         └─▶ 失败时：repo.UpdateFetchStatus(feedID, "failed", errMsg)
 ```
 
@@ -371,8 +373,9 @@ App
 │   └── MainContent
 │       ├── ArticleList          # 支持分页，未读/已读视觉区分
 │       │   └── ArticleItem      # 标题、来源（feed_title）、发布时间、星标按钮
-│       └── ArticleDetail        # 进入时自动标记已读；展示逻辑：
-│                                #   content 有实质内容 → 渲染正文（sanitize HTML）
+│       └── ArticleDetail        # 进入时自动标记已读（由后端 GET 触发，前端无需额外 PATCH）
+│                                # 展示逻辑：
+│                                #   content 有实质内容 → 用 DOMPurify sanitize 后渲染 HTML
 │                                #   content 仅为摘要  → 展示摘要 + "阅读原文"按钮（跳转 link）
 ```
 
@@ -382,7 +385,7 @@ App
 |------|-----------|------|
 | 订阅源列表 | `['feeds']` | 添加/删除/刷新后 invalidate，重新拉取（含 fetch_status 展示）；未来可改为 SSE 推送 |
 | 文章列表 | `['articles', filters]` | feed_id / starred / page 变化时重新 fetch |
-| 文章详情 | `['articles', id]` | 进入详情页时 fetch，同时触发 PATCH is_read=true |
+| 文章详情 | `['articles', id]` | 进入详情页时 fetch；后端 GET /api/articles/:id 已自动标记已读，无需前端额外发 PATCH |
 
 ### 未读 / 已读视觉区分
 

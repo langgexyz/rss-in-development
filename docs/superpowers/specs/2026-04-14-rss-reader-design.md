@@ -20,12 +20,17 @@
 初始化命令：
 
 ```bash
-# 在主仓库根目录执行
-git init frontend && git -C frontend commit --allow-empty -m "init"
-git submodule add ./frontend frontend
+# 在主仓库根目录执行（先在外部建好裸仓库再挂载）
+git init --bare /tmp/rss-frontend.git
+git init --bare /tmp/rss-backend.git
 
-git init backend && git -C backend commit --allow-empty -m "init"
-git submodule add ./backend backend
+git submodule add /tmp/rss-frontend.git frontend
+git submodule add /tmp/rss-backend.git backend
+git submodule update --init
+
+# 在子仓库中做首次提交
+git -C frontend commit --allow-empty -m "init"
+git -C backend  commit --allow-empty -m "init"
 ```
 
 ---
@@ -85,21 +90,21 @@ CREATE TABLE articles (
 
 ### 订阅源
 
-| Method   | Path                      | 说明                                 |
-|----------|---------------------------|--------------------------------------|
-| `POST`   | `/api/feeds`              | 添加订阅源，异步触发抓取，返回 202   |
-| `GET`    | `/api/feeds`              | 获取所有订阅源列表                   |
-| `GET`    | `/api/feeds/:id`          | 获取单个订阅源（含 fetch_status）    |
-| `POST`   | `/api/feeds/:id/refresh`  | 手动刷新，异步触发重新抓取，返回 202 |
-| `DELETE` | `/api/feeds/:id`          | 删除订阅源（级联删除文章）           |
+| Method   | Path                      | 说明                                              |
+|----------|---------------------------|---------------------------------------------------|
+| `POST`   | `/api/feeds`              | 添加订阅源，异步触发抓取，返回 202；URL 重复返回 409 |
+| `GET`    | `/api/feeds`              | 获取所有订阅源列表                                |
+| `GET`    | `/api/feeds/:id`          | 获取单个订阅源（含 fetch_status）                 |
+| `POST`   | `/api/feeds/:id/refresh`  | 手动刷新，异步触发重新抓取，返回 202；未到最小间隔返回 429 |
+| `DELETE` | `/api/feeds/:id`          | 删除订阅源（级联删除文章）                        |
 
 ### 文章
 
-| Method  | Path                | 说明                                           |
-|---------|---------------------|------------------------------------------------|
-| `GET`   | `/api/articles`     | 文章列表，支持 `?feed_id=&starred=&unread=&page=&page_size=` |
-| `GET`   | `/api/articles/:id` | 文章详情（同时标记已读）                       |
-| `PATCH` | `/api/articles/:id` | 更新 is_read / is_starred                      |
+| Method  | Path                | 说明                                                                      |
+|---------|---------------------|---------------------------------------------------------------------------|
+| `GET`   | `/api/articles`     | 文章列表，默认按 `published_at DESC`，支持 `?feed_id=&starred=&unread=&page=&page_size=`；不含 content 字段 |
+| `GET`   | `/api/articles/:id` | 文章详情，含完整 content 字段，同时自动将 is_read 置为 true               |
+| `PATCH` | `/api/articles/:id` | 更新 is_read / is_starred，返回更新后的完整文章对象                       |
 
 ### Request / Response 示例
 
@@ -116,6 +121,22 @@ CREATE TABLE articles (
   "fetch_status": "pending",
   "created_at": "2026-04-14T10:00:00Z"
 }
+
+// Response 409（URL 已存在）
+{ "code": "FEED_ALREADY_EXISTS", "message": "该订阅源已添加" }
+```
+
+**GET /api/feeds**
+```json
+[
+  {
+    "id": 1,
+    "url": "https://feeds.feedburner.com/ruanyifeng",
+    "title": "阮一峰的网络日志",
+    "fetch_status": "success",
+    "last_fetched_at": "2026-04-14T10:00:30Z"
+  }
+]
 ```
 
 **GET /api/feeds/:id**（查询单个订阅源状态）
@@ -226,11 +247,12 @@ type NormalizedFeed struct {
 
 type NormalizedArticle struct {
     GUID        string    // 各格式唯一ID统一映射到此，用于幂等入库
+                          // 降级策略：无 guid 时取 SHA256(link)，link 也无时取 SHA256(title+pubDate)
     Title       string
     Link        string
     Content     string    // 优先取全文，降级取摘要
     Author      string
-    PublishedAt time.Time // 统一转换为 UTC
+    PublishedAt time.Time // 统一转换为 UTC；源未提供时使用抓取时间
 }
 ```
 
@@ -280,12 +302,17 @@ Handler.CreateFeed()
 
 防止频繁请求打崩外部 RSS 源：
 
-1. **最小刷新间隔**：同一 feed 两次抓取间隔不得低于 `min_refresh_interval`（配置项），`POST /api/feeds/:id/refresh` 检查 `last_fetched_at`，未到间隔返回 429
+1. **最小刷新间隔**：同一 feed 两次抓取间隔不得低于 `min_refresh_interval`（配置项），`POST /api/feeds/:id/refresh` 检查 `last_fetched_at`，未到间隔返回 429；`last_fetched_at` 为 NULL（首次添加）时不受限制
 2. **HTTP 缓存头**：抓取时携带 `If-Modified-Since` / `If-None-Match`，源返回 304 时跳过解析和入库
 3. **全局并发上限**：用带缓冲 channel 做信号量，限制同时进行的抓取 goroutine 数（默认 5），防止批量添加订阅源时并发打崩对方
 
 ```go
-var fetchSemaphore = make(chan struct{}, 5) // 最多 5 个并发抓取
+// 信号量在应用启动时根据 config.fetcher.max_concurrent 初始化
+var fetchSemaphore chan struct{}
+
+func InitSemaphore(maxConcurrent int) {
+    fetchSemaphore = make(chan struct{}, maxConcurrent)
+}
 
 func (s *FeedService) TriggerFetch(feedID uint) {
     go func() {

@@ -75,7 +75,7 @@ CREATE TABLE articles (
 **关键决策：**
 
 - `(feed_id, guid)` 联合唯一索引：重复抓取幂等入库（`INSERT IGNORE`）
-- `fetch_status` 存在 feeds 表：客户端轮询抓取进度，与文章读取完全解耦
+- `fetch_status` 存在 feeds 表：展示抓取进度，与文章读取完全解耦；未来可扩展为 SSE 推送通知
 - `is_read` / `is_starred` 存在 articles 表：单用户场景，无需 user_articles 关联表
 - `content` 使用 `MEDIUMTEXT`：支持 RSS 全文内容
 
@@ -118,7 +118,7 @@ CREATE TABLE articles (
 }
 ```
 
-**GET /api/feeds/:id**（前端轮询用）
+**GET /api/feeds/:id**（查询单个订阅源状态）
 ```json
 {
   "id": 1,
@@ -223,6 +223,26 @@ Handler.CreateFeed()
         └─▶ 失败时：repo.UpdateFetchStatus(feedID, "failed", errMsg)
 ```
 
+### 抓取频率控制
+
+防止频繁请求打崩外部 RSS 源：
+
+1. **最小刷新间隔**：同一 feed 两次抓取间隔不得低于 `min_refresh_interval`（配置项），`POST /api/feeds/:id/refresh` 检查 `last_fetched_at`，未到间隔返回 429
+2. **HTTP 缓存头**：抓取时携带 `If-Modified-Since` / `If-None-Match`，源返回 304 时跳过解析和入库
+3. **全局并发上限**：用带缓冲 channel 做信号量，限制同时进行的抓取 goroutine 数（默认 5），防止批量添加订阅源时并发打崩对方
+
+```go
+var fetchSemaphore = make(chan struct{}, 5) // 最多 5 个并发抓取
+
+func (s *FeedService) TriggerFetch(feedID uint) {
+    go func() {
+        fetchSemaphore <- struct{}{}
+        defer func() { <-fetchSemaphore }()
+        // ... 执行抓取
+    }()
+}
+```
+
 ### config.yaml 关键配置项
 
 ```yaml
@@ -237,6 +257,8 @@ database:
 fetcher:
   timeout_seconds: 15          # RSS 抓取 HTTP 超时，可按需调整
   max_articles_per_feed: 100   # 单次抓取最多入库文章数
+  max_concurrent: 5            # 最大并发抓取数
+  min_refresh_interval: 300    # 同一 feed 最小刷新间隔（秒）
 ```
 
 ---
@@ -259,7 +281,7 @@ fetcher:
 App
 ├── Layout
 │   ├── Sidebar
-│   │   ├── AddFeedForm          # 输入 URL + 提交，提交后轮询 fetch_status
+│   │   ├── AddFeedForm          # 输入 URL + 提交，提交后 invalidate 订阅源列表
 │   │   ├── FeedList
 │   │   │   └── FeedItem         # 名称、更新时间、刷新按钮、删除按钮
 │   │   └── NavLinks             # 全部文章 / 收藏
@@ -273,8 +295,7 @@ App
 
 | 数据 | Query Key | 策略 |
 |------|-----------|------|
-| 订阅源列表 | `['feeds']` | 添加/删除后 invalidate |
-| 单个 feed 状态 | `['feeds', id]` | 添加/刷新后每 2s 轮询，status 变为 success/failed 后停止 |
+| 订阅源列表 | `['feeds']` | 添加/删除/刷新后 invalidate，重新拉取（含 fetch_status 展示）；未来可改为 SSE 推送 |
 | 文章列表 | `['articles', filters]` | feed_id / starred / page 变化时重新 fetch |
 | 文章详情 | `['articles', id]` | 进入详情页时 fetch，同时触发 PATCH is_read=true |
 

@@ -1,6 +1,6 @@
 [submodule "frontend"]
 	path = frontend
-	url = /tmp/rss-frontend
+	url = https://github.com/langgexyz/frontend.git
 [submodule "backend"]
 	path = backend
-	url = /tmp/rss-backend
+	url = https://github.com/langgexyz/rss-backend.git
